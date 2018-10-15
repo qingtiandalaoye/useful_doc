@@ -1,0 +1,868 @@
+功夫的处理流程说明：
+
+
+本文着重描述策略和TD之间的交互过程，以及过程中中使用的RequestID等信息
+
+1)
+策略的输出给发给TD的Message信息，通过写入journal发送给TD，如查询持仓方法，发单方法，撤单方法，对应于 req_position，insert_market_order，insert_limit_order，cancel_order
+策略的输入有：MD 收到的各种行情，写入journa，策略通过轮询被通知到，如on_market_data，on_price_book_update
+策略的输入有：TD在发单，撤单时遇到错误，写入journal，策略通过轮询被通知到，比如发单出错时on_rsp_order，撤单出错时on_rsp_order_action
+策略的输入有：TD从交易所得到的状态和成交回报，写入journal，策略通过轮询被通知到，如 on_rtn_order，on_rtn_trade
+策略的输入有：TD从交易所得到的持仓信息，写入journal，策略通过轮询被通知到，如 on_rsp_position
+
+
+
+1）
+TD的输入：策略写入的各种信息，TD通过轮询被通知到，如策略的查询持仓信息，发撤单消息，
+TD的输出有：向交易所查询仓位得到的反馈信息，写入journal，策略通过轮询被通知到，比如 on_rsp_position
+TD的输出有：向交易所发单撤单遇到的错误信息，写入journal，策略通过轮询被通知到，比如 on_rsp_order_insert，on_rsp_order_action
+TD的输出有：交易所返回的订单状态信息，成交回报信息，写入journal，策略通过轮询被通知到，比如on_rtn_order，on_rtn_trade
+
+
+
+
+
+
+策略类的操作过程
+
+CPP策略实现需要继承 IWCStrategy
+py策略继承的PyWCStrategy，而PyWCStrategy也是继承 IWCStrategy
+IWCStrategy则继承了IWCDataProcessor
+IWCDataProcessor包含的方法，则IWCStrategy 也同时包含：
+1)策略的输出给发给TD的Message信息，通过写入journal发送给TD，如查询持仓方法，发单方法，撤单方法，对应于 req_position，insert_market_order，insert_limit_order，cancel_order
+策略的输入有：MD 收到的各种行情，写入journa，策略通过轮询被通知到，如on_market_data，on_price_book_update
+策略的输入有：TD在发单，撤单时遇到错误，写入journal，策略通过轮询被通知到，比如发单出错时on_rsp_order，撤单出错时on_rsp_order_action
+策略的输入有：TD从交易所得到的状态和成交回报，写入journal，策略通过轮询被通知到，如 on_rtn_order，on_rtn_trade
+策略的输入有：TD从交易所得到的持仓信息，写入journal，策略通过轮询被通知到，如 on_rsp_position
+策略的父类 IWCStrategy 有一个start()方法，这个方法会启动一个线程，里面会运行 WCDataWrapper.run 方法，这个run会 不停的轮询新的frame数据并根据msg_type进行处理
+2) WCDataWrapper构造 WCDataWrapper(IWCDataProcessor *processor, WCStrategyUtil* util)
+ 当 run() 陆续读取出来MD,TD写的frame内容时，会根据 msg_type 来调用策略，也就是 IWCDataProcessor *processor 的处理函数，
+ 比如收到 md 发来的市场行情，调用策略的对应函数 on_market_data， on_price_book_update，
+	case MSG_TYPE_LF_PRICE_BOOK_20:
+		{
+			processor->on_price_book_update((LFPriceBook20Field*)data, msg_source, cur_time);
+			break;
+		}
+							
+ 比如收到 td 发来的发撤单回报，调用策略的对应函数 on_rsp_order，on_rtn_order，on_rtn_trade
+
+	case MSG_TYPE_LF_RTN_ORDER:
+		{
+			LFRtnOrderField * rtn_order = (LFRtnOrderField *) data;
+			order_statuses[request_id] = rtn_order->OrderStatus;
+			processor->on_rtn_order(rtn_order, request_id, msg_source, cur_time);
+
+			break;
+		}
+		
+
+
+3) 从上一条可以看到策略的父类 IWCStrategy 构造时会有一个WCStrategyUtil引用，所有策略调用的查持仓，发单，撤单等方法，实际上都是调用 WCStrategyUtil 的对应的函数实现
+	int IWCStrategy::insert_limit_order(short source, string instrument_id, string exchange_id, int64_t price, uint64_t volume, LfDirectionType direction, LfOffsetFlagType offset)
+	{
+		CHECK_TD_READY(source);
+		CHECK_EXCHANGE_AND_OFFSET(exchange_id, offset);
+		return util->insert_limit_order(source, instrument_id, exchange_id, price, volume, direction, offset);
+	}
+
+4) 详细说说 WCStrategyUtil 对RequestID的处理
+
+a)策略发单时，把InstrumentID和方向数量（市价单不用写价格）填好，
+发单信息放入 journal frame 时用 requestID 来标记这个请求，并把 requestID 返回调用者，即py或者c++策略。
+发单信息放入 journal frame 时也保存上一次 md 到来时记录的 md_nano 作为 extraNano 写入，可以理解为是这个 md 引起的发单，
+这样 md 来的时间和发单发出的时间（发单发出的时间在write_frame_full里面）就可以计算耗时了。
+
+通过查看看WCDataWrapper.cpp的run函数里面的代码，可以发现每次request_id == -1时候会更新这个WCStrategyUtil里面的md_nano时间为当前时间，
+如果是MSG_TYPE_LF_MD/MSG_TYPE_LF_PRICE_BOOK_20/MSG_TYPE_LF_L2_MD/MSG_TYPE_LF_L2_INDEX/MSG_TYPE_LF_L2_ORDER/MSG_TYPE_LF_L2_TRADE数据，就是cur_time时间，
+如果是MSG_TYPE_LF_RSP_POS/MSG_TYPE_LF_ORDER/MSG_TYPE_LF_ORDER_ACTION/MSG_TYPE_LF_RTN_ORDER/MSG_TYPE_LF_RTN_TRADE之类的，md_nano就会是-1。
+具体来说，比如在策略的on_rsp_position/on_rtn_order/on_rtn_trade函数里面发单，因为md_nano=-1，则没办法记录从收到on rtn order/on rtn trade消息到发单insertOrder时候的时间差。
+
+这个requestID 在每次调用的时候，都会在可用范围内加1，超过范围会从头开始
+
+	int StrategyUtil::get_rid()
+	{
+		return (cur_rid ++ % REQUEST_ID_RANGE) + rid_start;
+	}
+
+	int WCStrategyUtil::insert_market_order(short source,
+											string instrument_id,
+											string exchange_id,
+											uint64_t volume,
+											LfDirectionType direction,
+											LfOffsetFlagType offset)
+	{
+		int rid = get_rid();
+		LFInputOrderField order = {};
+		strcpy(order.ExchangeID, exchange_id.c_str());
+		strcpy(order.InstrumentID, instrument_id.c_str());
+		order.LimitPrice = 0;
+		order.Volume = volume;
+		order.MinVolume = 1;
+		order.TimeCondition = LF_CHAR_IOC;
+		order.VolumeCondition = LF_CHAR_AV;
+		order.OrderPriceType = LF_CHAR_AnyPrice;
+		order.Direction = direction;
+		order.OffsetFlag = offset;
+		order.HedgeFlag = LF_CHAR_Speculation;
+		order.ForceCloseReason = LF_CHAR_NotForceClose;
+		order.StopPrice = 0;
+		order.IsAutoSuspend = true;
+		order.ContingentCondition = LF_CHAR_Immediately;
+		strcpy(order.MiscInfo, strategy_name.c_str());
+		write_frame_extra(&order, sizeof(LFInputOrderField), source, MSG_TYPE_LF_ORDER, 1/*lastflag*/, rid, md_nano);
+		return rid;
+	}
+
+	int WCStrategyUtil::insert_limit_order(short source, string instrument_id, string exchange_id, int64_t price, uint64_t volume, LfDirectionType direction, LfOffsetFlagType offset)
+	{
+		int rid = get_rid();
+		LFInputOrderField order = {};
+		strcpy(order.ExchangeID, exchange_id.c_str());
+		strcpy(order.InstrumentID, instrument_id.c_str());
+		order.LimitPrice = price;
+		order.Volume = volume;
+		order.MinVolume = 1;
+		order.TimeCondition = LF_CHAR_GFD;
+		order.VolumeCondition = LF_CHAR_AV;
+		order.OrderPriceType = LF_CHAR_LimitPrice;
+		order.Direction = direction;
+		order.OffsetFlag = offset;
+		order.HedgeFlag = LF_CHAR_Speculation;
+		order.ForceCloseReason = LF_CHAR_NotForceClose;
+		order.StopPrice = 0;
+		order.IsAutoSuspend = true;
+		order.ContingentCondition = LF_CHAR_Immediately;
+		strcpy(order.MiscInfo, strategy_name.c_str());
+		write_frame_extra(&order, sizeof(LFInputOrderField), source, MSG_TYPE_LF_ORDER, 1/*lastflag*/, rid, md_nano);
+		return rid;
+	}
+
+	int WCStrategyUtil::insert_fok_order(short source, string instrument_id, string exchange_id, int64_t price, uint64_t volume, LfDirectionType direction, LfOffsetFlagType offset)
+	{
+		int rid = get_rid();
+		LFInputOrderField order = {};
+		strcpy(order.ExchangeID, exchange_id.c_str());
+		strcpy(order.InstrumentID, instrument_id.c_str());
+		order.LimitPrice = price;
+		order.Volume = volume;
+		order.MinVolume = 1;
+		order.TimeCondition = LF_CHAR_IOC;
+		order.VolumeCondition = LF_CHAR_CV;
+		order.OrderPriceType = LF_CHAR_LimitPrice;
+		order.Direction = direction;
+		order.OffsetFlag = offset;
+		order.HedgeFlag = LF_CHAR_Speculation;
+		order.ForceCloseReason = LF_CHAR_NotForceClose;
+		order.StopPrice = 0;
+		order.IsAutoSuspend = true;
+		order.ContingentCondition = LF_CHAR_Immediately;
+		strcpy(order.MiscInfo, strategy_name.c_str());
+		write_frame_extra(&order, sizeof(LFInputOrderField), source, MSG_TYPE_LF_ORDER, 1/*lastflag*/, rid, md_nano);
+		return rid;
+	}
+
+	int WCStrategyUtil::insert_fak_order(short source, string instrument_id, string exchange_id, int64_t price, uint64_t volume, LfDirectionType direction, LfOffsetFlagType offset)
+	{
+		int rid = get_rid();
+		LFInputOrderField order = {};
+		strcpy(order.ExchangeID, exchange_id.c_str());
+		strcpy(order.InstrumentID, instrument_id.c_str());
+		order.LimitPrice = price;
+		order.Volume = volume;
+		order.MinVolume = 1;
+		order.TimeCondition = LF_CHAR_IOC;
+		order.VolumeCondition = LF_CHAR_AV;
+		order.OrderPriceType = LF_CHAR_LimitPrice;
+		order.Direction = direction;
+		order.OffsetFlag = offset;
+		order.HedgeFlag = LF_CHAR_Speculation;
+		order.ForceCloseReason = LF_CHAR_NotForceClose;
+		order.StopPrice = 0;
+		order.IsAutoSuspend = true;
+		order.ContingentCondition = LF_CHAR_Immediately;
+		strcpy(order.MiscInfo, strategy_name.c_str());
+		write_frame_extra(&order, sizeof(LFInputOrderField), source, MSG_TYPE_LF_ORDER, 1/*lastflag*/, rid, md_nano);
+		return rid;
+	}
+
+
+b)
+ write_frame_extra 保存时，直接写进journal，如果本页写满了换新页继续写入。
+ 同时记录写入时间在 nano 里面，这样数据里面的 nano 与 extraNano 的距离就是从 md 到发单的耗时时间。
+ requestId就是上面提到的rid。
+
+	long JournalWriter::write_frame_full(const void* data, FH_TYPE_LENGTH length, FH_TYPE_SOURCE source, FH_TYPE_MSG_TP msgType,
+                                      FH_TYPE_LASTFG lastFlag, FH_TYPE_REQ_ID requestId, FH_TYPE_NANOTM extraNano,
+                                      FH_TYPE_ERR_ID errorId, const char* errorMsg)
+	{
+		void* buffer = journal->locateFrame();
+		Frame frame(buffer);
+		frame.setSource(source);
+		frame.setMsgType(msgType);
+		frame.setLastFlag(lastFlag);
+		frame.setRequestId(requestId);
+		frame.setErrorData(errorId, errorMsg, data, length);
+		frame.setExtraNano(extraNano);
+		long nano = getNanoTime();
+		frame.setNano(nano);
+		frame.setStatusWritten();
+		journal->passFrame();
+		return nano;
+	}
+
+	注意journal->locateFrame()里面有一个page本页写满了（或者读到底了）， 往下一页的换页过程
+	
+
+	
+	
+	
+TD 的处理过程
+ 
+  
+所有的td实现都继承 ITDEngine， 在这个ITDEngine::listening() 函数里面 不停的轮询 收到的messageType来调用具体的TD实现的函数
+1）TD的输入：策略写入的各种信息，TD通过轮询被通知到，如策略的查询持仓信息，发撤单消息，
+TD的输出有：向交易所查询仓位得到的反馈信息，写入journal，策略通过轮询被通知到，比如 on_rsp_position
+TD的输出有：向交易所发单撤单遇到的错误信息，写入journal，策略通过轮询被通知到，比如 on_rsp_order_insert，on_rsp_order_action
+TD的输出有：交易所返回的订单状态信息，成交回报信息，写入journal，策略通过轮询被通知到，比如on_rtn_order，on_rtn_trade
+
+2）先通过 reader->getFrameName() 来找到 clients.find(name), framename感觉应该就是是策略名称，比如YOUR_STRATEGY1
+注：看起来这里可能是kungfu.json里面配多个账户的关键：比如让不同的账户使用本td范围内唯一的不同的策略名称，达到支持多个td账户的功能？
+
+	void ITDEngine::listening()
+	{
+		yijinjing::FramePtr frame;
+		while (isRunning && signal_received < 0)
+		{
+			frame = reader->getNextFrame();
+			if (frame.get() != nullptr)
+			{
+				short msg_type = frame->getMsgType();
+				short msg_source = frame->getSource();
+				cur_time = frame->getNano();
+				if (msg_type == MSG_TYPE_LF_MD)
+				{
+					void* fdata = frame->getData();
+					LFMarketDataField* md = (LFMarketDataField*)fdata;
+					on_market_data(md, cur_time);
+					continue;
+				}
+				else if (msg_type < 200)
+				{
+					// system related...
+					if (msg_type == MSG_TYPE_TRADE_ENGINE_LOGIN && msg_source == source_id)
+					{
+						try
+						{
+							string content((char*)frame->getData());
+							json j_request = json::parse(content);
+							string client_name = j_request["name"].get<string>();
+							if (add_client(client_name, j_request))
+								KF_LOG_INFO(logger, "[user] Accepted: " << client_name);
+							else
+								KF_LOG_INFO(logger, "[user] Rejected: " << client_name);
+						}
+						catch (...)
+						{
+							KF_LOG_ERROR(logger, "error in parsing TRADE_ENGINE_LOGIN: " << (char*)frame->getData());
+						}
+					}
+					else if (msg_type == MSG_TYPE_STRATEGY_END)
+					{
+						try
+						{
+							string content((char*)frame->getData());
+							json j_request = json::parse(content);
+							string client_name = j_request["name"].get<string>();
+							if (remove_client(client_name, j_request))
+								KF_LOG_INFO(logger, "[user] Removed: " << client_name);
+						}
+						catch (...)
+						{
+							KF_LOG_ERROR(logger, "error in parsing STRATEGY_END: " << (char*)frame->getData());
+						}
+					}
+					else if(msg_type == MSG_TYPE_STRATEGY_POS_SET && msg_source == source_id)
+					{
+						try
+						{
+							string content((char*)frame->getData());
+							json j_request = json::parse(content);
+							string client_name = j_request["name"].get<string>();
+							user_helper->set_pos(client_name, j_request);
+							clients[client_name].pos_handler = PosHandler::create(source_id, content);
+							clients[client_name].pos_handler->set_fee(accounts[clients[client_name].account_index].fee_handler);
+							KF_LOG_INFO(logger, "[user] set pos: (client)" << client_name
+																		   << " (pos)" << clients[client_name].pos_handler->to_string());
+						}
+						catch (...)
+						{
+							KF_LOG_ERROR(logger, "error in parsing STRATEGY_POS_SET: " << (char*)frame->getData());
+						}
+					}
+					else if (msg_type == MSG_TYPE_TRADE_ENGINE_OPEN && (msg_source <= 0 || msg_source == source_id))
+					{
+						on_engine_open();
+					}
+					else if (msg_type == MSG_TYPE_TRADE_ENGINE_CLOSE && (msg_source <= 0 || msg_source == source_id))
+					{
+						on_engine_close();
+					}
+					else if (msg_type == MSG_TYPE_STRING_COMMAND)
+					{
+						string cmd((char*)frame->getData());
+						on_command(cmd);
+					}
+					else if (msg_type == MSG_TYPE_SWITCH_TRADING_DAY)
+					{
+	//                    std::cout<< "#################################MSG_TYPE_SWITCH_TRADING_DAY"<<std::endl;
+						user_helper->switch_day();
+						for (auto iter: clients)
+						{
+							if (iter.second.pos_handler.get() != nullptr)
+								iter.second.pos_handler->switch_day();
+						}
+						local_id = 1;
+	//                    std::cout<< "#################################MSG_TYPE_SWITCH_TRADING_DAY (local_id)" << local_id <<std::endl;
+						on_switch_day();
+					}
+				}
+				else if (msg_source == source_id && is_logged_in())
+				{
+					// from client
+					string name = reader->getFrameName();
+					auto iter = clients.find(name);
+					if (iter == clients.end())
+						continue;
+
+					void* fdata = frame->getData();
+					int requestId = frame->getRequestId();
+					int idx = iter->second.account_index;
+					switch (msg_type)
+					{
+						case MSG_TYPE_LF_QRY_POS:
+						{
+							LFQryPositionField* pos = (LFQryPositionField*)fdata;
+							strcpy(pos->BrokerID, accounts[idx].BrokerID);
+							strcpy(pos->InvestorID, accounts[idx].InvestorID);
+							req_investor_position(pos, idx, requestId);
+							break;
+						}
+						case MSG_TYPE_LF_ORDER:
+						{
+							LFInputOrderField* order = (LFInputOrderField*)fdata;
+							strcpy(order->BrokerID, accounts[idx].BrokerID);
+							strcpy(order->InvestorID, accounts[idx].InvestorID);
+							strcpy(order->UserID, accounts[idx].UserID);
+							strcpy(order->BusinessUnit, accounts[idx].BusinessUnit);
+							string order_ref = std::to_string(local_id);
+							td_helper->record_order(local_id, requestId);
+							user_helper->record_order(name, local_id, requestId, order->InstrumentID);
+							local_id ++;
+							strcpy(order->OrderRef, order_ref.c_str());
+							long before_nano = kungfu::yijinjing::getNanoTime();
+							req_order_insert(order, idx, requestId, cur_time);
+							// insert order, we need to track in send
+							send_writer->write_frame_extra(order, sizeof(LFInputOrderField), source_id, MSG_TYPE_LF_ORDER, 1/*ISLAST*/, requestId, before_nano);
+							KF_LOG_DEBUG(logger, "[insert_order] (rid)" << requestId << " (ticker)" << order->InstrumentID << " (ref)" << order_ref);
+							break;
+						}
+						case MSG_TYPE_LF_ORDER_ACTION:
+						{
+							LFOrderActionField* order = (LFOrderActionField*)fdata;
+							strcpy(order->BrokerID, accounts[idx].BrokerID);
+							strcpy(order->InvestorID, accounts[idx].InvestorID);
+							int order_id = order->KfOrderID;
+							int local_id;
+	//                        std::cout << "MSG_TYPE_LF_ORDER_ACTION: (name)"<<name  <<" (order_id)" << order_id << " (local_id)" << local_id <<std::endl;
+							if (user_helper->get_order(name, order_id, local_id, order->InstrumentID))
+							{
+								string order_ref = std::to_string(local_id);
+								strcpy(order->OrderRef, order_ref.c_str());
+								KF_LOG_DEBUG(logger, "[cancel_order] (rid)" << order_id << " (ticker)" << order->InstrumentID << " (ref)" << order_ref);
+								req_order_action(order, idx, requestId, cur_time);
+							}
+							break;
+						}
+						case MSG_TYPE_LF_QRY_ACCOUNT:
+						{
+							LFQryAccountField* acc = (LFQryAccountField*)fdata;
+							strcpy(acc->BrokerID, accounts[idx].BrokerID);
+							strcpy(acc->InvestorID, accounts[idx].InvestorID);
+							req_qry_account(acc, idx, requestId);
+							break;
+						}
+						default:
+							KF_LOG_DEBUG(logger, "[Unexpected] frame found: (msg_type)" << msg_type << ", (name)" << name);
+					}
+				}
+			}
+		}
+
+		if (IEngine::signal_received >= 0)
+		{
+			KF_LOG_INFO(logger, "[IEngine] signal received: " << IEngine::signal_received);
+		}
+
+		if (!isRunning)
+		{
+			KF_LOG_INFO(logger, "[IEngine] forced to stop.");
+		}
+	}
+
+	
+	
+	
+3）发单时候的处理过程：
+	case MSG_TYPE_LF_ORDER:
+		{
+			LFInputOrderField* order = (LFInputOrderField*)fdata;
+			strcpy(order->BrokerID, accounts[idx].BrokerID);
+			strcpy(order->InvestorID, accounts[idx].InvestorID);
+			strcpy(order->UserID, accounts[idx].UserID);
+			strcpy(order->BusinessUnit, accounts[idx].BusinessUnit);
+			string order_ref = std::to_string(local_id);
+			td_helper->record_order(local_id, requestId);
+			user_helper->record_order(name, local_id, requestId, order->InstrumentID);
+			local_id ++;
+			strcpy(order->OrderRef, order_ref.c_str());
+			long before_nano = kungfu::yijinjing::getNanoTime();
+			req_order_insert(order, idx, requestId, cur_time);
+			// insert order, we need to track in send
+			send_writer->write_frame_extra(order, sizeof(LFInputOrderField), source_id, MSG_TYPE_LF_ORDER, 1/*ISLAST*/, requestId, before_nano);
+			KF_LOG_DEBUG(logger, "[insert_order] (rid)" << requestId << " (ticker)" << order->InstrumentID << " (ref)" << order_ref);
+			break;
+		}
+ MSG_TYPE_LF_ORDER 就是发单的消息体类型， requestId 就是从策略来放入frame的requestID (经常标记为rid)
+ 这里面有一个 local_id 来记录每次使用的订单号，也就是orderRef,
+ 这个 local_id 会在 遇到switch_day消息 时，重新设置等于1;
+
+ 
+ 发现消息体会从account来填补UserID，BrokerID，InvestorID， BusinessUnit等信息
+	记录当前这个发单号和 requestID 的关系 record_order(local_id, requestId) 的过程:
+		其中order_id 就是requestID; local_id 就是 orderRef
+		orderRef是用于 td 全局的，不同的策略用的同一个 td，使用的 orderRef 是同一个递增序列，这样不同的策略也就不会使用同一个 OrderRef 数字了。
+		如果订单号 OrderRef 超过了可用订单数量 TD_AVAILABLE_ORDER_LIMIT = 100000，进行取模，意味着一个TD只能最多十万个未完成订单
+		查看这个订单号位置的订单状态，如果还没结束，就往下取
+		如果取到底，就返回空， record_order()得到空就什么也不做
+		如果没取到底，就返回可用的 idx 值，并且记录 last_local_index 为这个新的 idx, 这个 last_local_index 没别处使用
+		----------------如果因为取模的原因，折返了怎么办？目前看是会覆盖
+		
+	
+			void TDEngineInfoHelper::record_order(int local_id, int order_id)
+			{
+				TDBasicOrderInfo* order = locate_writable(local_id);
+				if (order != nullptr)
+				{
+					order->order_id = order_id;
+					order->local_id = local_id;
+					order->status = LF_CHAR_OrderInserted;
+				}
+			}
+
+			TDBasicOrderInfo* TDEngineInfoHelper::locate_writable(int local_id)
+			{
+				int idx = local_id % TD_AVAILABLE_ORDER_LIMIT;
+				int count = 0;
+				char status = info->orders[idx].status;
+				while (order_is_existing(status) && count < TD_AVAILABLE_ORDER_LIMIT)
+				{
+					idx = (idx + 1) % TD_AVAILABLE_ORDER_LIMIT;
+					status = info->orders[idx].status;
+					count ++;
+				}
+				if (count == TD_AVAILABLE_ORDER_LIMIT)
+					return nullptr;
+				else
+				{
+					if (idx > info->last_local_index)
+						info->last_local_index = idx;
+					return &(info->orders[idx]);
+				}
+			}
+
+			inline bool order_is_existing(char status)
+			{
+				return status != ORDER_INFO_RAW
+					   && status != LF_CHAR_Error
+					   && status != LF_CHAR_AllTraded
+					   && status != LF_CHAR_Canceled
+					   && status != LF_CHAR_PartTradedNotQueueing;
+			}
+
+
+
+		
+	记录订单信息：策略，orderRef,requestId, order->InstrumentID  user_helper->record_order(name, local_id, requestId, order->InstrumentID) 的过程:
+		其中order_id 就是requestID; local_id 就是orderRef
+		根据名字寻找到TDUserInfo* info = get_user_info(user_name); 后面的处理都是与这个名字对应的记录有关
+		如果订单号OrderRef超过了可用订单数量 AVAILABLE_ORDER_LIMIT = 10000，进行取模， 意味着一个策略只能最多一万个未完成订单
+		查看这个订单号位置的订单状态，如果还没结束，就往下取
+		如果取到底，就返回空。record_order()得到空就什么也不做
+		如果没取到底，就返回可用的idx值，并且记录 last_order_index 为这个新的 idx
+		----------------如果因为取模的原因，折返了怎么办？目前看是会覆盖
+		当策略退出的时候回调用 remove_client ,里面会调用 get_existing_orders 从0到 last_order_index 来取得 order_is_existing 的订单，再一个个发送撤单请求req_order_action
+		----------------有一个问题是： strncpy(order_info->ticker, ticker, ORDER_INFO_TICKER_LIMIT); ORDER_INFO_TICKER_LIMIT的长度是15和标准的不同char_31 InstrumentID;//合约代码 
+		
+	orderRef加1， 等着下次使用
+	取当前时间before_nano，调用td实现的req_order_insert，之后再记录 write_frame_extra，把before_nano当做extraNano记录下来，
+	因为frame写入时有个时间戳frame.setNano(nano); nano = getNanoTime()，所以这个extraNano和nano的距离可以用来计算 req_order_insert 函数的用时
+	
+	可以看到发单过程只要经过处理，一定会补充上UserID。
+	-----遇到一个问题：发单的时候(YOUR_STRATEGY1_204_20180919.csv)出现了没有UserID,也没有orderRef的jourmal记录，那么唯一原因，
+	应该是根本没有进入这个处理逻辑。可能处理函数被别的地方阻塞了，也可能TD已经出错退出了，但策略还在持续放入数据，可是这些数据没有被TD取出处理。
+	
+	另外，这些没有UserID,也没有orderRef的单子信息在New_YOUR_STRATEGY1_204_20180919.csv有记录而在New_TD_SEND_COINMEX_19204_20180919.csv没有记录，
+	而case MSG_TYPE_LF_ORDER的处理是， 必定要调用req_order_insert产生记录的， 也说明了，这处理逻辑代码根本没有被调用。
+	
+
+		void TDUserInfoHelper::record_order(const string& user_name, int local_id, int order_id, const char* ticker)
+		{
+			TDOrderInfo* order_info = locate_writable(user_name, order_id);
+			if (order_info != nullptr)
+			{
+				order_info->order_id = order_id;
+				order_info->local_id = local_id;
+				order_info->status = LF_CHAR_OrderInserted;
+				strncpy(order_info->ticker, ticker, ORDER_INFO_TICKER_LIMIT);
+			}
+		}
+
+		TDOrderInfo* TDUserInfoHelper::locate_writable(const string &user_name, int order_id)
+		{
+			TDUserInfo* info = get_user_info(user_name);
+			if (info == nullptr)
+				return nullptr;
+			int idx = order_id % AVAILABLE_ORDER_LIMIT;
+			int count = 0;
+			char status = info->orders[idx].status;
+			while (order_is_existing(status) && count < AVAILABLE_ORDER_LIMIT)
+			{
+				idx = (idx + 1) % AVAILABLE_ORDER_LIMIT;
+				status = info->orders[idx].status;
+				count++;
+			}
+			if (count == AVAILABLE_ORDER_LIMIT)
+				return nullptr;
+			else
+			{
+				if (idx > info->last_order_index)
+					info->last_order_index = idx;
+				return &(info->orders[idx]);
+			}
+		}
+
+
+
+
+
+				
+			
+4）撤单时候的处理过程
+a)策略方的输出， TD的输入
+撤单时候，策略会根据发单时拿到的RequestID来进行撤单cancel_order(short source, int order_id)， 其中order_id就是发单函数返回的requestID(常标记位rid)
+撤单的处理也是WCStrategyUtil来进行的，撤单时提交原始发送的单子的requestID， 撤单结构体字段 KfOrderID 里面记录这个 requestID
+同时撤单体也包含一个 RequestID，用来存放撤单操作本身新创建的 requestID。
+放入journal frame时用新创建的 requestID来标记这个请求，并把requestID返回调用者，即py或者c++策略。
+
+	int WCStrategyUtil::cancel_order(short source, int order_id)
+	{
+		if (order_id < rid_start || order_id > rid_end)
+			return -1;
+		int rid = get_rid();
+		LFOrderActionField req = {};
+		req.KfOrderID = order_id;
+		req.ActionFlag = LF_CHAR_Delete;
+		req.LimitPrice = 0;
+		req.VolumeChange = 0;
+		req.RequestID = rid;
+		write_frame(&req, sizeof(LFOrderActionField), source, MSG_TYPE_LF_ORDER_ACTION, 1/*lastflag*/, rid);
+		return rid;
+	}
+
+
+b）
+write_frame部分略过，此处没有记录额外的时间信息 extraNano， 记录frame的RequestId为新创建的 requestID。
+
+c）TD收到撤单消息来进行处理
+
+	case MSG_TYPE_LF_ORDER_ACTION:
+	{
+		LFOrderActionField* order = (LFOrderActionField*)fdata;
+		strcpy(order->BrokerID, accounts[idx].BrokerID);
+		strcpy(order->InvestorID, accounts[idx].InvestorID);
+		int order_id = order->KfOrderID;
+		int local_id;
+		if (user_helper->get_order(name, order_id, local_id, order->InstrumentID))
+		{
+			string order_ref = std::to_string(local_id);
+			strcpy(order->OrderRef, order_ref.c_str());
+			KF_LOG_DEBUG(logger, "[cancel_order] (rid)" << order_id << " (ticker)" << order->InstrumentID << " (ref)" << order_ref);
+			req_order_action(order, idx, requestId, cur_time);
+		}
+		break;
+	}
+
+	从frame中取出int requestId = frame->getRequestId();
+	从account复制BrokerID，InvestorID 到撤单结构体
+	从order_id = order->KfOrderID 找到原始的发单信息的 requestID 记录
+	查找发单记录 user_helper->get_order(name, order_id, local_id, order->InstrumentID)) 并填写回InstrumentID， local_id
+	如果没找到发单记录就忽略本次撤单请求
+	如果找到发单记录， 把原始发单记录的 orderRef 找出来，放到撤单结构的 OrderRef 中，都是用地址来操作的，会补充撤单消息体里面的 InstrumentID,OrderRef等字段
+		.......
+		void* fdata = frame->getData();
+		...........
+		LFOrderActionField* order = (LFOrderActionField*)fdata;
+		.....
+		if (user_helper->get_order(name, order_id, local_id, order->InstrumentID))
+		{
+			.....
+			strcpy(order->OrderRef, order_ref.c_str());
+		}
+		......
+	
+	然后调用 TD 实现的撤单函数 req_order_action
+	
+	遇到问题：撤单时出现了没有InstrumentID,local_id的单子的原因，应该是在"如果没找到发单记录就忽略本次撤单请求"  或者根本没有进入这个处理逻辑。
+	这些没在New_YOUR_STRATEGY1_207_20180919.csv有记录， 而在New_TD_SEND_COINMEX_19207_20180919.csv没有记录
+							
+		bool TDUserInfoHelper::get_order(const string& user_name, int order_id, int &local_id, char* ticker) const
+		{
+			TDOrderInfo* order_info = locate_readable(user_name, order_id);
+			if (order_info != nullptr)
+			{
+				local_id = order_info->local_id;
+				strncpy(ticker, order_info->ticker, ORDER_INFO_TICKER_LIMIT);
+				return true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+
+
+5）TD发送出错处理
+TD的具体实现在遇到错误后， 立即把反馈写会journal，策略的 WCDataWrapper.run 轮询读到信息并处理
+	如果发单出错， 会立即更新订单的状态为出错
+	出错的信息也要回应着原始信息的RequestID
+
+	void ITDEngine::on_rsp_order_insert(const LFInputOrderField* order, int requestId, int errorId, const char* errorMsg)
+	{
+		if (errorId == 0)
+		{
+			writer->write_frame(order, sizeof(LFInputOrderField), source_id, MSG_TYPE_LF_ORDER, true, requestId);
+			KF_LOG_DEBUG(logger, "[RspOrder]" << " (rid)" << requestId
+											  << " (ticker)" << order->InstrumentID);
+		}
+		else
+		{
+			string name = rid_manager.get(requestId);
+			user_helper->set_order_status(name, requestId, LF_CHAR_Error);
+			writer->write_error_frame(order, sizeof(LFInputOrderField), source_id, MSG_TYPE_LF_ORDER, true, requestId, errorId, errorMsg);
+			KF_LOG_ERROR(logger, "[RspOrder] fail!" << " (rid)" << requestId << " (errorId)" << errorId << " (errorMsg)" << errorMsg);
+		}
+	}
+	void ITDEngine::on_rsp_order_action(const LFOrderActionField *action, int requestId, int errorId, const char *errorMsg)
+	{
+		if (errorId == 0)
+		{
+			writer->write_frame(action, sizeof(LFOrderActionField), source_id, MSG_TYPE_LF_ORDER_ACTION, true, requestId);
+			KF_LOG_DEBUG(logger, "[RspAction]" << " (rid)" << requestId
+											   << " (ticker)" << action->InstrumentID);
+		}
+		else
+		{
+			writer->write_error_frame(action, sizeof(LFOrderActionField), source_id, MSG_TYPE_LF_ORDER_ACTION, true, requestId, errorId, errorMsg);
+			KF_LOG_ERROR(logger, "[RspAction] fail!" << " (rid)" << requestId << " (errorId)" << errorId << " (errorMsg)" << errorMsg);
+		}
+	}
+
+6)
+ TD收到状态信息以及成交回报
+
+ TD的状态和成交处理部分， 一定要保证orderRef是正确的，这样才能够通过get_order_id(int local_id)来找到原始的发单信息的requestID
+ 
+ TD从交易所得到状态信息OnRtnOrder，调用TD的on_rtn_order，并把信息写入RAW，如果LFRtnOrderField记录有requestID，就写入frame的requestID，没有就写-1
+ TD从交易所得到成交信息OnRtnTrade，调用TD的on_rtn_trade，并把信息写入RAW，frame的requestID记录-1
+
+	void TDEngineCTP::OnRtnOrder(CThostFtdcOrderField *pOrder)
+	{
+		auto rtn_order = parseFrom(*pOrder);
+		on_rtn_order(&rtn_order);
+		raw_writer->write_frame(pOrder, sizeof(CThostFtdcOrderField),
+								source_id, MSG_TYPE_LF_RTN_ORDER_CTP,
+								1/*islast*/, (pOrder->RequestID > 0) ? pOrder->RequestID: -1);
+	}
+
+	void TDEngineCTP::OnRtnTrade(CThostFtdcTradeField *pTrade)
+	{
+		auto rtn_trade = parseFrom(*pTrade);
+		on_rtn_trade(&rtn_trade);
+		raw_writer->write_frame(pTrade, sizeof(CThostFtdcTradeField),
+								source_id, MSG_TYPE_LF_RTN_TRADE_CTP, 1/*islast*/, -1/*invalidRid*/);
+	}
+
+   
+   状态信息的处理部分on_rtn_order， 会更新订单的状态
+   成交信息的处理部分on_rtn_trade， 会更新订单的持仓信息
+ 
+
+	void ITDEngine::on_rtn_order(const LFRtnOrderField* rtn_order)
+	{
+		int local_id = std::stoi(string(rtn_order->OrderRef));
+		int rid = td_helper->get_order_id(local_id);
+		writer->write_frame(rtn_order, sizeof(LFRtnOrderField), source_id, MSG_TYPE_LF_RTN_ORDER, 1/*islast*/, rid);
+		KF_LOG_DEBUG_FMT(logger, "[o] (id)%d (ref)%s (ticker)%s (Vsum)%llu (Vtrd)%llu (Vrmn)%llu (Price)%llu (St)%c",
+						 rid,
+						 rtn_order->OrderRef,
+						 rtn_order->InstrumentID,
+						 rtn_order->VolumeTotalOriginal,
+						 rtn_order->VolumeTraded,
+						 rtn_order->VolumeTotal,
+						 rtn_order->LimitPrice,
+						 rtn_order->OrderStatus);
+		string name = rid_manager.get(rid);
+		user_helper->set_order_status(name, rid, rtn_order->OrderStatus);
+		td_helper->set_order_status(local_id, rtn_order->OrderStatus);
+	}
+	/** on rtn trade, engine (on_data) */
+	void ITDEngine::on_rtn_trade(const LFRtnTradeField* rtn_trade)
+	{
+		int local_id = std::stoi(string(rtn_trade->OrderRef));
+		int rid = td_helper->get_order_id(local_id);
+		writer->write_frame(rtn_trade, sizeof(LFRtnTradeField), source_id, MSG_TYPE_LF_RTN_TRADE, 1/*islast*/, rid);
+		KF_LOG_DEBUG_FMT(logger, "[t] (id)%d (ref)%s (ticker)%s (V)%llu (P)%lld (D)%c",
+						 rid,
+						 rtn_trade->OrderRef,
+						 rtn_trade->InstrumentID,
+						 rtn_trade->Volume,
+						 rtn_trade->Price,
+						 rtn_trade->Direction);
+		string name = rid_manager.get(rid);
+		auto iter = clients.find(name);
+		if (iter != clients.end() && iter->second.pos_handler.get() != nullptr)
+		{
+			iter->second.pos_handler->update(rtn_trade);
+			KF_LOG_DEBUG(logger, "[cost]"
+					<< " (long_amt)" << iter->second.pos_handler->get_long_balance(rtn_trade->InstrumentID)
+					<< " (long_fee)" << iter->second.pos_handler->get_long_fee(rtn_trade->InstrumentID)
+					<< " (short_amt)" << iter->second.pos_handler->get_short_balance(rtn_trade->InstrumentID)
+					<< " (short_fee)" << iter->second.pos_handler->get_short_fee(rtn_trade->InstrumentID)
+			);
+		}
+	}
+
+	int TDEngineInfoHelper::get_order_id(int local_id)
+	{
+		TDBasicOrderInfo* order = locate_readable(local_id);
+		if (order != nullptr)
+			return order->order_id;
+		else
+			return -1;
+	}
+	
+	
+	
+	
+journal dump的导出处理
+
+journal dump导出的信息结构包含2个部分一个是data信息， 一个是frame本身的信息，比如
+write_frame_extra(&order, sizeof(LFInputOrderField), source, MSG_TYPE_LF_ORDER, 1/*lastflag*/, rid, md_nano);
+这个过程order 是一个LFInputOrderField结构体，里面有自己的很多字段，而frame本身还有MSG_TYPE_LF_ORDER，rid（就是requestID）和md_nano （此处是extraNano）还有记录frame的写入时间的nano
+
+导出也会有着2个部分， 体现在大写字母开头是结构体自己的内容，比如 BrokerID，RequestID，OrderRef
+小写的是frame自己的内容， 比如 h_error_id， h_request_id， h_nano，h_extra_nano
+
+
+1)只有2个结构具有RequestID，一个是订单状态回报 LFRtnOrderField  ，一个是撤单，  LFOrderActionField
+LFOrderActionField前面撤单部分已经说明了，LFRtnOrderField是交易所返回的信息，自己创建的LFRtnOrderField的requestID=0。
+2) 字段h_request_id对应的就是frame的requestID。
+其他大写字母开头的列，是longfist_structs.py里面给每个结构定义的列名称。
+
+yjj dump 命令使用的脚本来自 journal_dumper
+	-----------------journal_dumper.py
+	def dump_csv(csv_file, client, folders, names, t_msg_type, start_nano, end_nano, visualized=False, to_print=False):
+		reader = libjournal.createReader(folders, names, client, start_nano)
+		csv_file = open(csv_file, 'wb')
+		csv_writer = csv.writer(csv_file, delimiter=',')
+		frame = reader.next()
+		name = reader.name()
+		header_printed = False
+		while frame != None and frame.nano() < end_nano:
+			msg_type = frame.msg_type()
+			if msg_type == t_msg_type:
+				row = lfutil.get_contents(frame)
+				row.append(('h_extra_nano', 'l', frame.extra_nano()))
+				row.append(('h_nano', 'l', frame.nano()))
+				if visualized:
+					row.append(('h_nano_s', 's', strfnano(frame.nano())))
+				row.append(('h_msg_type', 'i', msg_type))
+				row.append(('h_request_id', 'i', frame.request_id()))
+				row.append(('h_source', 'i', frame.source()))
+				row.append(('h_is_last', 'i', frame.is_last()))
+				row.append(('h_error_id', 'i', frame.error_id()))
+				row.append(('j_name', 's', name))
+				if not header_printed:
+					headers = map(lambda x:'{}({})'.format(x[0], x[1]), row)
+					csv_writer.writerow(headers)
+					if to_print:
+						print ','.join(headers)
+					header_printed = True
+				contents = map(lambda x: str(x[2]), row)
+				csv_writer.writerow(contents)
+				if to_print:
+					print ','.join(contents)
+			frame = reader.next()
+			name = reader.name()
+
+	--------------longfist_utils.py
+	def get_contents_d(data):
+		res = []
+		if structs.DataFieldMap.has_key(data.__class__.__name__):
+			for field_name, field_type in data._fields_:
+				tp_s = structs.DataFieldMap[data.__class__.__name__][field_name]
+				if type(tp_s) is dict:
+					type_s = 't'
+					content = tp_s.get(getattr(data, field_name), 'UnExpected')
+				else:
+					type_s = tp_s
+					content = getattr(data, field_name)
+				res.append((field_name, type_s, content))
+			return res
+		else:
+			for field_name, field_type in data._fields_:
+				res.append((field_name, field_type, getattr(data, field_name)))
+			return res
+			
+	---------------------longfist_structs.py
+		
+	class LFRtnOrderField(Structure):
+		_fields_ = [
+			("BrokerID", c_char * 11),	# 经纪公司代码 
+			("UserID", c_char * 16),	# 用户代码 
+			("ParticipantID", c_char * 11),	# 会员代码 
+			("InvestorID", c_char * 19),	# 投资者代码 
+			("BusinessUnit", c_char * 21),	# 业务单元 
+			("InstrumentID", c_char * 31),	# 合约代码 
+			("OrderRef", c_char * 21),	# 报单引用 
+			("ExchangeID", c_char * 11),	# 交易所代码 
+			("LimitPrice", c_int64),	# 价格 
+			("VolumeTraded", c_uint64),	# 今成交数量 
+			("VolumeTotal", c_uint64),	# 剩余数量 
+			("VolumeTotalOriginal", c_uint64),	# 数量 
+			("TimeCondition", c_char),	# 有效期类型 LfTimeConditionType
+			("VolumeCondition", c_char),	# 成交量类型 LfVolumeConditionType
+			("OrderPriceType", c_char),	# 报单价格条件 LfOrderPriceTypeType
+			("Direction", c_char),	# 买卖方向 LfDirectionType
+			("OffsetFlag", c_char),	# 开平标志 LfOffsetFlagType
+			("HedgeFlag", c_char),	# 投机套保标志 LfHedgeFlagType
+			("OrderStatus", c_char),	# 报单状态 LfOrderStatusType
+			("RequestID", c_int),	# 请求编号 
+			]
+		
+	LFRtnOrderField 订单状态回报这个里面的requestID，但我们没有用它。 
+	CTP部分的代码是这么使用的， (pOrder->RequestID > 0) ? pOrder->RequestID: -1   就是说当有值的时候就用，没有就写 -1
+	在我们liandao里面，这个订单状态里面的requestID应该都是0， 我再确认一下。 --我觉得这个requestID可以不要
+	撤单结构体里面的requestID，是在发送撤单信息的时候产生的， 这个requestID也没什么用途。  因为撤单的信息包含在 KfOrderID 和OrderRef中。
+	
+	
